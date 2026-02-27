@@ -1,80 +1,68 @@
 import os
-import time
-import uuid
 import re
-import yt_dlp
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
-from google.genai import types
-from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for grading
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 class AskRequest(BaseModel):
     video_url: str
     topic: str
 
+
+def extract_video_id(url: str):
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]+)", url)
+    return match.group(1) if match else None
+
+
+def seconds_to_hhmmss(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 @app.post("/ask")
 async def ask(request: AskRequest):
 
-    temp_filename = f"audio_{uuid.uuid4()}.mp3"
-
     try:
-        # 1️⃣ Download audio only
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": temp_filename,
-            "quiet": True,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        }
+        video_id = extract_video_id(request.video_url)
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([request.video_url])
+        # 1️⃣ Get transcript
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
 
-        # 2️⃣ Upload file
-        uploaded_file = client.files.upload(file=temp_filename)
+        # 2️⃣ Combine transcript text
+        full_text = ""
+        for entry in transcript:
+            full_text += f"[{entry['start']}] {entry['text']} "
 
-        # 3️⃣ Wait until ACTIVE
-        while uploaded_file.state != types.FileState.ACTIVE:
-            time.sleep(3)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-
-        # 4️⃣ Ask Gemini (no structured schema — enforce format via prompt)
+        # 3️⃣ Ask Gemini to find timestamp in transcript
         response = client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=[
-                uploaded_file,
-                f"""
-                Find the FIRST time the topic "{request.topic}" is spoken.
-                Return ONLY the timestamp in HH:MM:SS format.
-                Example: 00:05:47
-                """
-            ],
+            contents=f"""
+            Given the transcript below, find the FIRST time the topic "{request.topic}" appears.
+            Return ONLY the timestamp in seconds (number only).
+
+            Transcript:
+            {full_text[:20000]}
+            """
         )
 
-        text_output = response.text
+        seconds_match = re.search(r"\d+", response.text)
+        if not seconds_match:
+            raise HTTPException(status_code=500, detail="Timestamp not found")
 
-        match = re.search(r"\d{2}:\d{2}:\d{2}", text_output)
-        if not match:
-            raise HTTPException(status_code=500, detail="Invalid timestamp format")
-
-        timestamp = match.group()
+        seconds = int(seconds_match.group())
+        timestamp = seconds_to_hhmmss(seconds)
 
         return {
             "timestamp": timestamp,
@@ -84,7 +72,3 @@ async def ask(request: AskRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
