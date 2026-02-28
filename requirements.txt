@@ -1,5 +1,5 @@
-youtube-transcript-api
-google-genai
 fastapi
 uvicorn
+google-genai
+youtube-transcript-api
 python-dotenv
